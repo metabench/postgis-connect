@@ -1,0 +1,8 @@
+{
+  "host": "localhost",
+  "port": 5432,
+  "database": "osm",
+  "user": "postgres",
+  "password": "your_password",
+  "schema": "public"
+}

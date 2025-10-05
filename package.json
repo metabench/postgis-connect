@@ -1,0 +1,21 @@
+{
+  "name": "postgis-connect",
+  "version": "1.0.0",
+  "description": "node.js connects to a PostGIS database, a facade to provide unified access patterns to a variety of db setups",
+  "main": "index.js",
+  "scripts": {
+    "test": "node test.js"
+  },
+  "keywords": [
+    "postgis",
+    "postgres",
+    "osm",
+    "database"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "pg": "^8.11.3",
+    "dotenv": "^16.3.1"
+  }
+}
