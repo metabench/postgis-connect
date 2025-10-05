@@ -53,6 +53,28 @@ async function main() {
       console.log(`  Columns: ${columns.map(c => c.column_name).join(', ')}`);
     });
 
+    // Display comprehensive schema analysis
+    console.log('\n=== Comprehensive Schema Analysis ===');
+    const schemaAnalysis = adapter.getSchemaAnalysis();
+    console.log('\nOSM Table Mapping:');
+    console.log(`  Point tables: ${schemaAnalysis.analysis.osmTableMapping.point.map(t => t.table_name).join(', ') || 'none'}`);
+    console.log(`  Line tables: ${schemaAnalysis.analysis.osmTableMapping.line.map(t => t.table_name).join(', ') || 'none'}`);
+    console.log(`  Polygon tables: ${schemaAnalysis.analysis.osmTableMapping.polygon.map(t => t.table_name).join(', ') || 'none'}`);
+    console.log(`  Boundary tables: ${schemaAnalysis.analysis.osmTableMapping.boundaries.map(t => t.table_name).join(', ') || 'none'}`);
+    
+    console.log('\nAvailable Admin Levels:', schemaAnalysis.analysis.availableAdminLevels.join(', ') || 'none found');
+    
+    console.log('\nRecommended Tables:');
+    Object.entries(schemaAnalysis.analysis.recommendedTables).forEach(([purpose, table]) => {
+      console.log(`  ${purpose}: ${table || 'not found'}`);
+    });
+    
+    console.log('\nGeometry Columns Found in Tables:');
+    Object.entries(schemaAnalysis.analysis.geometryColumns).slice(0, 5).forEach(([table, geomCols]) => {
+      console.log(`  ${table}: ${geomCols.map(g => `${g.column} (${g.type})`).join(', ')}`);
+    });
+
+
     // Get country list with areas
     console.log('\n=== Countries (with calculated areas) ===');
     try {
@@ -134,6 +156,58 @@ async function main() {
         });
       } catch (error) {
         console.log(`Could not build hierarchical structure: ${error.message}`);
+      }
+
+      // Test three-level hierarchy facade
+      console.log('\n=== Three-Level Hierarchy Facade ===');
+      try {
+        console.log('Building three-level hierarchy for top 2 countries...');
+        const threeLevels = await adapter.getThreeLevelHierarchy(2);
+        
+        threeLevels.forEach((item, index) => {
+          console.log(`\n${index + 1}. ${item.country.name} (Country - Level 2)`);
+          console.log(`   Level 1 (Admin Level ${item.level1AdminLevel}): ${item.level1Count} areas`);
+          
+          if (item.level1Areas.length > 0) {
+            item.level1Areas.slice(0, 2).forEach((level1Area, i) => {
+              console.log(`   ${i + 1}. ${level1Area.name}`);
+              console.log(`      Level 2 sub-areas: ${level1Area.subAreaCount}`);
+              if (level1Area.subAreas.length > 0) {
+                const subNames = level1Area.subAreas.slice(0, 3).map(a => a.name).join(', ');
+                console.log(`      Examples: ${subNames}`);
+              }
+            });
+            if (item.level1Areas.length > 2) {
+              console.log(`   ... and ${item.level1Areas.length - 2} more level 1 areas`);
+            }
+          }
+        });
+      } catch (error) {
+        console.log(`Could not build three-level hierarchy: ${error.message}`);
+      }
+
+      // Test EU countries facade
+      console.log('\n=== European Union Countries ===');
+      try {
+        const euData = await adapter.getEUCountries();
+        console.log(`\nEU Information:`);
+        console.log(`  Name: ${euData.eu.name}`);
+        if (euData.eu.osm_id) {
+          console.log(`  OSM ID: ${euData.eu.osm_id}`);
+          console.log(`  Admin Level: ${euData.eu.admin_level}`);
+        }
+        if (euData.eu.note) {
+          console.log(`  Note: ${euData.eu.note}`);
+        }
+        
+        console.log(`\nMember Countries (${euData.memberCount}):`);
+        euData.memberCountries.forEach((country, index) => {
+          console.log(`${index + 1}. ${country.name} (OSM ID: ${country.osm_id})`);
+        });
+        
+        console.log(`\nMember Country IDs: ${euData.memberCountryIds.join(', ')}`);
+      } catch (error) {
+        console.log(`Could not retrieve EU countries: ${error.message}`);
       }
 
     } catch (error) {

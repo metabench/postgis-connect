@@ -4,10 +4,14 @@ Node.js adapter to connect to a PostGIS OSM database, providing a unified access
 
 ## Features
 
-- **Database Introspection**: Automatically discovers tables, views, and columns in the database
+- **Comprehensive Schema Analysis**: Automatically discovers and analyzes database structure with detailed mapping
+- **Database Introspection**: Discovers tables, views, columns, indexes, and constraints
 - **OSM-Aware**: Recognizes common osm2pgsql table patterns and structures
+- **Schema Mapping**: Analyzes how the database maps to OSM expectations
 - **Country Data**: Retrieve country boundaries with PostGIS-calculated areas
 - **Hierarchical Admin Areas**: Get admin areas at any level, organized hierarchically within countries
+- **Three-Level Hierarchy Facade**: Query countries with nested sub-levels in a single call
+- **EU Countries Facade**: Find European Union and retrieve member country IDs
 - **Facade Pattern Support**: Foundation for implementing various access facades for different admin levels
 - **Flexible**: Adapts to different osm2pgsql configurations and table naming conventions
 - **Metadata Caching**: Introspects database once and caches metadata for efficient access
@@ -88,6 +92,8 @@ The adapter automatically introspects the database to discover:
 1. **Tables**: All tables in the schema with size information
 2. **Views**: All views in the schema with their definitions
 3. **Columns**: All columns in tables and views with data types
+4. **Indexes**: All indexes for optimization analysis
+5. **Constraints**: Primary keys, foreign keys, and other constraints
 
 ```javascript
 // Get all discovered tables
@@ -102,6 +108,28 @@ const columns = adapter.getTableColumns('planet_osm_polygon');
 // Get full metadata for a table
 const metadata = adapter.getTableMetadata('planet_osm_polygon');
 ```
+
+### Comprehensive Schema Analysis
+
+The adapter performs comprehensive analysis of the database schema:
+
+```javascript
+// Get detailed schema analysis
+const analysis = adapter.getSchemaAnalysis();
+
+// Analysis includes:
+// - OSM table mapping (point, line, polygon, boundaries)
+// - Geometry column information
+// - Admin level distribution
+// - Available admin levels in the database
+// - Recommended tables for common operations
+```
+
+The schema analysis helps the adapter:
+- Map database structure to OSM expectations
+- Identify the best tables for specific queries
+- Understand admin level availability
+- Provide detailed structural information for facades
 
 ### Working with OSM Data
 
@@ -201,6 +229,72 @@ const hierarchical = await adapter.getHierarchicalAdminAreas('4');
 // ]
 ```
 
+### Three-Level Hierarchy Facade
+
+Get countries with two nested levels of sub-divisions in a single query:
+
+```javascript
+// Get top 5 countries with their hierarchical sub-divisions
+const threeLevels = await adapter.getThreeLevelHierarchy(5);
+// Returns:
+// [
+//   {
+//     country: { name: 'United States', osm_id: 123, ... },
+//     level1AdminLevel: '4',  // States
+//     level1Areas: [
+//       {
+//         name: 'California',
+//         osm_id: 456,
+//         subAreas: [
+//           { name: 'Los Angeles County', ... },
+//           { name: 'San Francisco County', ... },
+//           ...
+//         ],
+//         subAreaCount: 58
+//       },
+//       ...
+//     ],
+//     level1Count: 50
+//   },
+//   ...
+// ]
+```
+
+This facade is useful for:
+- Building navigation hierarchies
+- Creating drill-down interfaces
+- Understanding administrative structure at multiple levels
+
+### European Union Countries Facade
+
+Find the EU and get its member country IDs:
+
+```javascript
+const euData = await adapter.getEUCountries();
+// Returns:
+// {
+//   eu: {
+//     osm_id: 123456,
+//     name: 'European Union',
+//     admin_level: '2',
+//     area_sq_km: 4233255
+//   },
+//   memberCountries: [
+//     { osm_id: 1, name: 'Austria', ... },
+//     { osm_id: 2, name: 'Belgium', ... },
+//     ...
+//   ],
+//   memberCountryIds: [1, 2, 3, ...],
+//   memberCount: 27
+// }
+```
+
+This facade:
+- Finds the EU entity in the database (admin area)
+- Uses spatial queries to find countries within EU boundaries
+- Falls back to a known member list if EU boundary not in database
+- Returns member country OSM IDs for further queries
+
 ### Raw Queries
 
 Execute custom SQL queries:
@@ -223,8 +317,13 @@ npm test
 This will:
 1. Connect to the database
 2. Display discovered tables and views
-3. Show OSM-specific tables and their columns
-4. List countries with calculated areas
+3. Show comprehensive schema analysis
+4. Show OSM-specific tables and their columns
+5. Display available admin levels
+6. List countries with calculated areas
+7. Demonstrate hierarchical admin area queries
+8. Show three-level hierarchy facade
+9. Display EU countries and member IDs
 
 ## How it Works
 
@@ -235,6 +334,23 @@ On connection, the adapter runs several queries to understand the database struc
 1. Queries `information_schema.tables` to find all tables and their sizes
 2. Queries `information_schema.views` to discover views
 3. Queries `information_schema.columns` to get column information
+4. Queries `pg_class` and `pg_index` to discover indexes
+5. Queries `information_schema.table_constraints` for constraints
+
+### Comprehensive Schema Analysis
+
+After introspection, the adapter performs comprehensive analysis:
+
+1. **OSM Table Mapping**: Categorizes tables by type (point, line, polygon, boundaries)
+2. **Geometry Column Analysis**: Identifies all geometry/geography columns
+3. **Admin Level Distribution**: Discovers which admin levels exist and their counts
+4. **Recommendations**: Suggests best tables for common operations
+
+This analysis:
+- Maps the database structure to OSM expectations
+- Ensures queries use the correct tables and columns
+- Identifies optimal access patterns
+- Provides detailed structural information for building facades
 
 This metadata is cached and used to:
 - Adapt to different osm2pgsql configurations

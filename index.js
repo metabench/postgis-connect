@@ -48,12 +48,24 @@ class PostGISAdapter {
       tables: null,
       views: null,
       columns: null,
+      indexes: null,
+      constraints: null,
+    };
+    
+    // Enhanced schema analysis
+    this.schemaAnalysis = {
+      osmTableMapping: null,
+      geometryColumns: {},
+      adminLevelDistribution: {},
+      availableAdminLevels: [],
+      recommendedTables: {},
     };
     
     // Cache for admin area queries
     this.adminAreaCache = {
       countries: null,
       adminLevels: {},
+      euCountries: null,
     };
   }
 
@@ -96,11 +108,18 @@ class PostGISAdapter {
       this.discoverTables(),
       this.discoverViews(),
       this.discoverColumns(),
+      this.discoverIndexes(),
+      this.discoverConstraints(),
     ]);
 
     console.log(`Discovered ${this.metadata.tables.length} tables`);
     console.log(`Discovered ${this.metadata.views.length} views`);
     console.log(`Discovered ${this.metadata.columns.length} columns`);
+    console.log(`Discovered ${this.metadata.indexes?.length || 0} indexes`);
+    console.log(`Discovered ${this.metadata.constraints?.length || 0} constraints`);
+    
+    // Perform comprehensive schema analysis
+    await this.analyzeSchema();
   }
 
   /**
@@ -162,6 +181,232 @@ class PostGISAdapter {
     const result = await this.pool.query(query, [this.schema]);
     this.metadata.columns = result.rows;
     return result.rows;
+  }
+
+  /**
+   * Discover all indexes in the schema
+   */
+  async discoverIndexes() {
+    const query = `
+      SELECT
+        t.relname as table_name,
+        i.relname as index_name,
+        a.attname as column_name,
+        ix.indisunique as is_unique,
+        ix.indisprimary as is_primary
+      FROM pg_class t
+      JOIN pg_index ix ON t.oid = ix.indrelid
+      JOIN pg_class i ON i.oid = ix.indexrelid
+      JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(ix.indkey)
+      JOIN pg_namespace n ON n.oid = t.relnamespace
+      WHERE n.nspname = $1
+      ORDER BY t.relname, i.relname;
+    `;
+
+    try {
+      const result = await this.pool.query(query, [this.schema]);
+      this.metadata.indexes = result.rows;
+      return result.rows;
+    } catch (error) {
+      console.warn('Could not discover indexes:', error.message);
+      this.metadata.indexes = [];
+      return [];
+    }
+  }
+
+  /**
+   * Discover constraints in the schema
+   */
+  async discoverConstraints() {
+    const query = `
+      SELECT
+        tc.table_name,
+        tc.constraint_name,
+        tc.constraint_type,
+        kcu.column_name
+      FROM information_schema.table_constraints tc
+      LEFT JOIN information_schema.key_column_usage kcu
+        ON tc.constraint_name = kcu.constraint_name
+        AND tc.table_schema = kcu.table_schema
+      WHERE tc.table_schema = $1
+      ORDER BY tc.table_name, tc.constraint_name;
+    `;
+
+    try {
+      const result = await this.pool.query(query, [this.schema]);
+      this.metadata.constraints = result.rows;
+      return result.rows;
+    } catch (error) {
+      console.warn('Could not discover constraints:', error.message);
+      this.metadata.constraints = [];
+      return [];
+    }
+  }
+
+  /**
+   * Perform comprehensive schema analysis
+   * Analyzes the discovered schema and maps it to OSM expectations
+   */
+  async analyzeSchema() {
+    console.log('\n=== Analyzing Schema ===');
+    
+    // Identify OSM tables and their purposes
+    this.analyzeOSMTables();
+    
+    // Analyze geometry columns
+    this.analyzeGeometryColumns();
+    
+    // Analyze admin level distribution
+    await this.analyzeAdminLevels();
+    
+    // Generate recommendations
+    this.generateRecommendations();
+    
+    console.log('Schema analysis complete\n');
+  }
+
+  /**
+   * Analyze OSM tables and map them to their purposes
+   */
+  analyzeOSMTables() {
+    const osmTables = this.findOSMTables();
+    
+    this.schemaAnalysis.osmTableMapping = {
+      point: osmTables.filter(t => t.table_name.includes('point')),
+      line: osmTables.filter(t => t.table_name.includes('line') || t.table_name.includes('road')),
+      polygon: osmTables.filter(t => t.table_name.includes('polygon')),
+      boundaries: osmTables.filter(t => t.table_name.includes('boundaries')),
+      other: osmTables.filter(t => 
+        !t.table_name.includes('point') && 
+        !t.table_name.includes('line') && 
+        !t.table_name.includes('road') &&
+        !t.table_name.includes('polygon') &&
+        !t.table_name.includes('boundaries')
+      ),
+    };
+    
+    console.log(`Identified ${osmTables.length} OSM tables:`);
+    console.log(`  - Point tables: ${this.schemaAnalysis.osmTableMapping.point.length}`);
+    console.log(`  - Line/Road tables: ${this.schemaAnalysis.osmTableMapping.line.length}`);
+    console.log(`  - Polygon tables: ${this.schemaAnalysis.osmTableMapping.polygon.length}`);
+    console.log(`  - Boundary tables: ${this.schemaAnalysis.osmTableMapping.boundaries.length}`);
+    console.log(`  - Other OSM tables: ${this.schemaAnalysis.osmTableMapping.other.length}`);
+  }
+
+  /**
+   * Analyze geometry columns across all tables
+   */
+  analyzeGeometryColumns() {
+    const geometryTables = {};
+    
+    this.metadata.tables.forEach(table => {
+      const columns = this.getTableColumns(table.table_name);
+      const geomColumns = columns.filter(c => 
+        c.data_type === 'USER-DEFINED' && 
+        (c.udt_name === 'geometry' || c.udt_name === 'geography')
+      );
+      
+      if (geomColumns.length > 0) {
+        geometryTables[table.table_name] = geomColumns.map(c => ({
+          column: c.column_name,
+          type: c.udt_name,
+        }));
+      }
+    });
+    
+    this.schemaAnalysis.geometryColumns = geometryTables;
+    console.log(`Found geometry columns in ${Object.keys(geometryTables).length} tables`);
+  }
+
+  /**
+   * Analyze admin level distribution in the database
+   */
+  async analyzeAdminLevels() {
+    const polygonTables = [
+      ...this.schemaAnalysis.osmTableMapping.polygon,
+      ...this.schemaAnalysis.osmTableMapping.boundaries,
+    ];
+    
+    const adminLevelData = {};
+    
+    for (const table of polygonTables) {
+      const columns = this.getTableColumns(table.table_name);
+      const hasAdminLevel = columns.some(c => c.column_name === 'admin_level');
+      
+      if (hasAdminLevel) {
+        try {
+          const query = `
+            SELECT 
+              admin_level,
+              COUNT(*) as count
+            FROM ${this.schema}.${table.table_name}
+            WHERE admin_level IS NOT NULL
+              AND boundary = 'administrative'
+            GROUP BY admin_level
+            ORDER BY admin_level::int;
+          `;
+          
+          const result = await this.pool.query(query);
+          
+          if (result.rows.length > 0) {
+            adminLevelData[table.table_name] = result.rows;
+            
+            // Track all available admin levels
+            result.rows.forEach(row => {
+              if (!this.schemaAnalysis.availableAdminLevels.includes(row.admin_level)) {
+                this.schemaAnalysis.availableAdminLevels.push(row.admin_level);
+              }
+            });
+          }
+        } catch (error) {
+          // Skip tables that don't support this query
+        }
+      }
+    }
+    
+    this.schemaAnalysis.adminLevelDistribution = adminLevelData;
+    this.schemaAnalysis.availableAdminLevels.sort((a, b) => parseInt(a) - parseInt(b));
+    
+    console.log(`Available admin levels: ${this.schemaAnalysis.availableAdminLevels.join(', ')}`);
+  }
+
+  /**
+   * Generate recommendations for optimal data access
+   */
+  generateRecommendations() {
+    const recommendations = {};
+    
+    // Recommend best table for admin boundaries
+    const polygonTables = this.schemaAnalysis.osmTableMapping.polygon;
+    if (polygonTables.length > 0) {
+      // Prefer tables with more comprehensive data
+      const bestTable = polygonTables.reduce((best, current) => {
+        const currentColumns = this.getTableColumns(current.table_name);
+        const bestColumns = best ? this.getTableColumns(best.table_name) : [];
+        return currentColumns.length > bestColumns.length ? current : best;
+      }, null);
+      
+      recommendations.adminBoundaries = bestTable?.table_name;
+    }
+    
+    // Recommend tables for different geometry types
+    recommendations.points = this.schemaAnalysis.osmTableMapping.point[0]?.table_name;
+    recommendations.lines = this.schemaAnalysis.osmTableMapping.line[0]?.table_name;
+    recommendations.polygons = this.schemaAnalysis.osmTableMapping.polygon[0]?.table_name;
+    
+    this.schemaAnalysis.recommendedTables = recommendations;
+    console.log('Recommended tables for common queries:', recommendations);
+  }
+
+  /**
+   * Get detailed schema analysis report
+   * @returns {Object} Comprehensive schema analysis
+   */
+  getSchemaAnalysis() {
+    return {
+      metadata: this.metadata,
+      analysis: this.schemaAnalysis,
+    };
   }
 
   /**
@@ -544,6 +789,263 @@ class PostGISAdapter {
       adminLevel: null,
       areas: [],
     };
+  }
+
+  /**
+   * Get three-level hierarchical admin areas starting with countries
+   * Returns countries -> first sub-level -> second sub-level
+   * @param {number} limit - Maximum number of countries to process (default: all)
+   * @returns {Array} Three-level hierarchical structure
+   */
+  async getThreeLevelHierarchy(limit = null) {
+    const countries = await this.getCountries();
+    const countriesToProcess = limit ? countries.slice(0, limit) : countries;
+    
+    const hierarchy = [];
+    
+    for (const country of countriesToProcess) {
+      try {
+        // Get first level down (usually level 3 or 4)
+        const level1 = await this.getNextAdminLevelInCountry(country.name);
+        
+        if (level1.areas.length > 0) {
+          // For each first-level area, get the next level down
+          const level1WithSubAreas = [];
+          
+          for (const area1 of level1.areas) {
+            try {
+              // Get second level down
+              const level2 = await this.getAdminAreasWithin(area1.osm_id, country.name);
+              
+              level1WithSubAreas.push({
+                ...area1,
+                subAreas: level2,
+                subAreaCount: level2.length,
+              });
+            } catch (error) {
+              // If we can't get sub-areas, include without them
+              level1WithSubAreas.push({
+                ...area1,
+                subAreas: [],
+                subAreaCount: 0,
+              });
+            }
+          }
+          
+          hierarchy.push({
+            country: {
+              osm_id: country.osm_id,
+              name: country.name,
+              admin_level: country.admin_level,
+              area_sq_km: country.area_sq_km,
+            },
+            level1AdminLevel: level1.adminLevel,
+            level1Areas: level1WithSubAreas,
+            level1Count: level1WithSubAreas.length,
+          });
+        } else {
+          // Country with no sub-areas
+          hierarchy.push({
+            country: {
+              osm_id: country.osm_id,
+              name: country.name,
+              admin_level: country.admin_level,
+              area_sq_km: country.area_sq_km,
+            },
+            level1AdminLevel: null,
+            level1Areas: [],
+            level1Count: 0,
+          });
+        }
+      } catch (error) {
+        console.warn(`Could not build hierarchy for ${country.name}:`, error.message);
+      }
+    }
+    
+    return hierarchy;
+  }
+
+  /**
+   * Get admin areas within a parent area by OSM ID
+   * @param {number} parentOsmId - OSM ID of the parent area
+   * @param {string} countryName - Name of the country (for optimization)
+   * @returns {Array} Admin areas within the parent
+   */
+  async getAdminAreasWithin(parentOsmId, countryName) {
+    const osmTables = this.findOSMTables();
+    const polygonTables = osmTables.filter(t => 
+      t.table_name.includes('polygon') || t.table_name.includes('boundaries')
+    );
+
+    if (polygonTables.length === 0) {
+      return [];
+    }
+
+    for (const table of polygonTables) {
+      const columns = this.getTableColumns(table.table_name);
+      const hasAdminLevel = columns.some(c => c.column_name === 'admin_level');
+      
+      if (hasAdminLevel) {
+        try {
+          const geomColumn = this.findGeometryColumn(table.table_name);
+          
+          // Find areas within the parent area
+          const query = `
+            SELECT 
+              child.osm_id,
+              child.name,
+              child.admin_level,
+              child.boundary,
+              ST_Area(child.${geomColumn}::geography) / 1000000 as area_sq_km
+            FROM ${this.schema}.${table.table_name} child,
+                 ${this.schema}.${table.table_name} parent
+            WHERE parent.osm_id = $1
+              AND child.osm_id != $1
+              AND child.admin_level::int > parent.admin_level::int
+              AND child.boundary = 'administrative'
+              AND child.name IS NOT NULL
+              AND ST_Within(ST_Centroid(child.${geomColumn}), parent.${geomColumn})
+            ORDER BY child.admin_level::int, child.area_sq_km DESC;
+          `;
+
+          const result = await this.pool.query(query, [parentOsmId]);
+          
+          if (result.rows.length > 0) {
+            // Filter to get only the immediate next level
+            const minLevel = Math.min(...result.rows.map(r => parseInt(r.admin_level)));
+            return result.rows.filter(r => parseInt(r.admin_level) === minLevel);
+          }
+        } catch (error) {
+          // Try next table
+        }
+      }
+    }
+
+    return [];
+  }
+
+  /**
+   * Find the European Union and get its member country IDs
+   * The EU is typically represented as an admin area in OSM
+   * @returns {Object} EU information with member country IDs
+   */
+  async getEUCountries() {
+    // Return cached data if available
+    if (this.adminAreaCache.euCountries) {
+      return this.adminAreaCache.euCountries;
+    }
+
+    const osmTables = this.findOSMTables();
+    const polygonTables = osmTables.filter(t => 
+      t.table_name.includes('polygon') || t.table_name.includes('boundaries')
+    );
+
+    if (polygonTables.length === 0) {
+      throw new Error('No suitable polygon tables found');
+    }
+
+    // First, try to find the EU entity
+    for (const table of polygonTables) {
+      const columns = this.getTableColumns(table.table_name);
+      const hasName = columns.some(c => c.column_name === 'name');
+      
+      if (hasName) {
+        try {
+          const geomColumn = this.findGeometryColumn(table.table_name);
+          
+          // Look for EU entity - it might be named "European Union" or have an EU tag
+          const euQuery = `
+            SELECT 
+              osm_id,
+              name,
+              admin_level,
+              boundary,
+              ST_Area(${geomColumn}::geography) / 1000000 as area_sq_km
+            FROM ${this.schema}.${table.table_name}
+            WHERE (
+              name ILIKE '%European Union%' 
+              OR name ILIKE '%EU%'
+              OR name = 'EU'
+            )
+            AND boundary = 'administrative'
+            LIMIT 1;
+          `;
+
+          const euResult = await this.pool.query(euQuery);
+          
+          if (euResult.rows.length > 0) {
+            const eu = euResult.rows[0];
+            
+            // Now find countries that are within or overlap with the EU
+            const memberQuery = `
+              SELECT 
+                c.osm_id,
+                c.name,
+                c.admin_level,
+                ST_Area(c.${geomColumn}::geography) / 1000000 as area_sq_km
+              FROM ${this.schema}.${table.table_name} c,
+                   ${this.schema}.${table.table_name} eu
+              WHERE eu.osm_id = $1
+                AND c.admin_level = '2'
+                AND c.boundary = 'administrative'
+                AND c.name IS NOT NULL
+                AND (
+                  ST_Within(ST_Centroid(c.${geomColumn}), eu.${geomColumn})
+                  OR ST_Overlaps(c.${geomColumn}, eu.${geomColumn})
+                  OR ST_Intersects(c.${geomColumn}, eu.${geomColumn})
+                )
+              ORDER BY c.name;
+            `;
+
+            const memberResult = await this.pool.query(memberQuery, [eu.osm_id]);
+            
+            const result = {
+              eu: eu,
+              memberCountries: memberResult.rows,
+              memberCountryIds: memberResult.rows.map(c => c.osm_id),
+              memberCount: memberResult.rows.length,
+            };
+            
+            this.adminAreaCache.euCountries = result;
+            return result;
+          }
+        } catch (error) {
+          console.warn('Error finding EU:', error.message);
+        }
+      }
+    }
+
+    // Fallback: If EU entity not found, use a hardcoded list of EU member countries
+    // This is more reliable as the EU boundary might not exist in all OSM databases
+    const euMemberNames = [
+      'Austria', 'Belgium', 'Bulgaria', 'Croatia', 'Cyprus', 'Czechia', 
+      'Denmark', 'Estonia', 'Finland', 'France', 'Germany', 'Greece', 
+      'Hungary', 'Ireland', 'Italy', 'Latvia', 'Lithuania', 'Luxembourg',
+      'Malta', 'Netherlands', 'Poland', 'Portugal', 'Romania', 'Slovakia',
+      'Slovenia', 'Spain', 'Sweden'
+    ];
+    
+    const countries = await this.getCountries();
+    const euCountries = countries.filter(c => 
+      euMemberNames.some(euName => 
+        c.name.includes(euName) || euName.includes(c.name)
+      )
+    );
+    
+    const result = {
+      eu: {
+        osm_id: null,
+        name: 'European Union (from member list)',
+        admin_level: null,
+        note: 'EU boundary not found in database, using member country list',
+      },
+      memberCountries: euCountries,
+      memberCountryIds: euCountries.map(c => c.osm_id),
+      memberCount: euCountries.length,
+    };
+    
+    this.adminAreaCache.euCountries = result;
+    return result;
   }
 
   /**
